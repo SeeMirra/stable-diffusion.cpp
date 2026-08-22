@@ -354,7 +354,16 @@ bool ModelManager::validate_registered_tensors() {
 bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*>& states) {
     std::vector<TensorState*> need_load;
     need_load.reserve(states.size());
+    int scan_i = 0;
     for (TensorState* state : states) {
+        scan_i++;
+        if ((scan_i % 32) == 0) {
+            sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+            if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+                LOG_DEBUG("model manager tensor scan cancelled by user");
+                return false;
+            }
+        }
         if (state == nullptr || should_ignore(*state) || is_optional_missing_tensor(state->name)) {
             continue;
         }
@@ -442,6 +451,12 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
     }
 
     for (const auto& pair : states_by_staging_target) {
+        sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+        if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+            LOG_DEBUG("model manager compute staging cancelled by user (group boundary)");
+            return false;
+        }
+
         ggml_backend_t compute_backend          = pair.first.first;
         ggml_backend_buffer_type_t staging_buft = pair.first.second;
         const std::vector<TensorState*>& states = pair.second;
@@ -477,6 +492,14 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
         ggml_backend_buffer_set_usage(compute_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
         for (auto& staged_tensor : staged_tensors) {
+            sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+            if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+                LOG_DEBUG("model manager compute staging cancelled by user (per-tensor)");
+                // Bail without pushing the partial block. Tensors already swapped in
+                // this group keep pointing at the (leaked, still-alive) staging buffer,
+                // so the model stays consistent; the next generation re-stages them.
+                return false;
+            }
             TensorState* state          = staged_tensor.first;
             ggml_tensor* managed_tensor = state->tensor;
             ggml_tensor* staging_tensor = staged_tensor.second;
@@ -661,7 +684,16 @@ bool ModelManager::mmap_params(const std::vector<TensorState*>& states,
                                std::vector<ParamsStorageBlock*>& created_storage_blocks) {
     std::map<std::string, ggml_tensor*> mmap_candidates;
     std::map<std::string, TensorState*> mmap_states;
+    int loop_i = 0;
     for (TensorState* state : states) {
+        loop_i++;
+        if ((loop_i % 32) == 0) {
+            sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+            if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+                LOG_DEBUG("model manager mmap candidates cancelled by user");
+                return false;
+            }
+        }
         if (state == nullptr || !can_mmap_storage(*state) || state->tensor == nullptr ||
             state->tensor->data != nullptr || state->tensor->view_src != nullptr) {
             continue;
@@ -821,6 +853,12 @@ bool ModelManager::load_tensors(const std::vector<TensorState*>& states) {
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
         const std::string& name = tensor_storage.name;
         *dst_tensor             = nullptr;
+
+        sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+        if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+            LOG_DEBUG("model manager tensor load cancelled by user");
+            return false;  // abort the load
+        }
 
         auto state_it = states_by_name.find(name);
         if (state_it == states_by_name.end()) {

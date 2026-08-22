@@ -5594,6 +5594,25 @@ static std::vector<float> make_hires_sigma_schedule(sd_ctx_t* sd_ctx,
                               sigmas.end());
 }
 
+// Installs the cancel-check hook for the duration of a generation so the backend
+// graph executors can interrupt an in-flight compute mid-step when the user stops.
+struct SDCancelHookGuard {
+    StableDiffusionGGML* sd = nullptr;
+
+    explicit SDCancelHookGuard(StableDiffusionGGML* sd_ptr) : sd(sd_ptr) {
+        sd_set_cancel_check_callback(&SDCancelHookGuard::check, sd);
+    }
+
+    ~SDCancelHookGuard() {
+        sd_set_cancel_check_callback(nullptr, nullptr);
+    }
+
+    static bool check(void* user_data) {
+        StableDiffusionGGML* self = static_cast<StableDiffusionGGML*>(user_data);
+        return self != nullptr && self->get_cancel_flag() == SD_CANCEL_ALL;
+    }
+};
+
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* sd_img_gen_params,
                            sd_image_t** images_out,
@@ -5621,6 +5640,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     }
 
     sd_ctx->sd->reset_cancel_flag();
+    SDCancelHookGuard cancel_hook(sd_ctx->sd);
 
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
@@ -6864,6 +6884,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
 
     sd_ctx->sd->reset_cancel_flag();
+    SDCancelHookGuard cancel_hook(sd_ctx->sd);
 
     const RefImageParams ref_image_params;
 

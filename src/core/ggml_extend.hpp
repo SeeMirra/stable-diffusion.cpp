@@ -1773,6 +1773,57 @@ struct GGMLRunnerContext {
 struct GGMLRunner {
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
+
+    // How often (in graph nodes) the mid-step cancel check fires during a compute.
+    static constexpr size_t SD_CANCEL_CHECK_INTERVAL = 32;
+
+    // Scheduler eval callback: chunks the graph compute so the cancel flag is
+    // checked between chunks. Returns false on ask==false to abort the compute.
+    static bool sched_cancel_eval_cb(struct ggml_tensor* /*t*/, bool ask, void* user_data) {
+        GGMLRunner* self = static_cast<GGMLRunner*>(user_data);
+        if (ask) {
+            if (sd_get_cancel_check_callback() == nullptr) {
+                return false;  // no hook: keep the whole split in a single chunk
+            }
+            return (++self->eval_node_counter_ % SD_CANCEL_CHECK_INTERVAL) == 0;
+        }
+        sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+        if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+            return false;  // stop the graph compute
+        }
+        return true;
+    }
+
+    // Non-scheduler path: same chunking/cancel semantics, but also honors the
+    // user's tensor-observation eval callback when one is registered.
+    static bool compute_cancel_eval_cb(struct ggml_tensor* t, bool ask, void* user_data) {
+        GGMLRunner* self              = static_cast<GGMLRunner*>(user_data);
+        sd_cancel_check_t cancel_cb   = sd_get_cancel_check_callback();
+        sd_graph_eval_callback_t user_cb = sd_get_backend_eval_callback();
+        if (ask) {
+            if (user_cb != nullptr && user_cb(t, true, sd_get_backend_eval_callback_data())) {
+                return true;
+            }
+            if (cancel_cb == nullptr) {
+                return false;
+            }
+            return (++self->eval_node_counter_ % SD_CANCEL_CHECK_INTERVAL) == 0;
+        }
+        if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+            return false;
+        }
+        if (user_cb != nullptr) {
+            return user_cb(t, false, sd_get_backend_eval_callback_data());
+        }
+        return true;
+    }
+
+    // Installs the cancel-check eval callback on the current scheduler, if any.
+    void install_cancel_eval_callback() {
+        if (sched != nullptr && sd_get_cancel_check_callback() != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched, &GGMLRunner::sched_cancel_eval_cb, this);
+        }
+    }
     using GraphCutSegment = sd::ggml_graph_cut::Segment;
     using GraphCutPlan    = sd::ggml_graph_cut::Plan;
 
@@ -1797,6 +1848,7 @@ protected:
     size_t sched_graph_capacity            = 0;
     ggml_backend_t cpu_fallback_backend    = nullptr;  // owned, sched requires a trailing CPU backend
     bool multi_device_eval_callback_warned = false;
+    size_t eval_node_counter_              = 0;  // chunk counter for the mid-step cancel check
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
     std::weak_ptr<RunnerWeightManager> weight_manager;
@@ -1985,6 +2037,12 @@ protected:
             return true;
         }
 
+        sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+        if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+            LOG_DEBUG("%s prepare graph weights cancelled by user", get_desc().c_str());
+            return false;
+        }
+
         if (!manager->prepare_params(params_to_prepare)) {
             LOG_ERROR("%s prepare graph weights failed", get_desc().c_str());
             return false;
@@ -2087,6 +2145,7 @@ protected:
                                                                       sd::ggml_graph_cut::leaf_count(gf))
                                                : 1;
         if (sched != nullptr && sched_graph_capacity >= required_graph_size) {
+            install_cancel_eval_callback();
             return true;
         }
         if (sched != nullptr) {
@@ -2132,6 +2191,7 @@ protected:
             return false;
         }
         sched_graph_capacity = required_graph_size;
+        install_cancel_eval_callback();
         return true;
     }
 
@@ -2856,11 +2916,24 @@ protected:
         } else {
             status = sd_backend_graph_compute_with_eval_callback(runtime_backend,
                                                                  gf,
-                                                                 sd_get_backend_eval_callback(),
-                                                                 sd_get_backend_eval_callback_data());
+                                                                 &GGMLRunner::compute_cancel_eval_cb,
+                                                                 this);
         }
-        if (status != GGML_STATUS_SUCCESS) {
-            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+        if (status == GGML_STATUS_SUCCESS) {
+            // The sched eval callback interrupts the compute mid-graph but the sched
+            // still reports success; catch a cancel here so the caller discards the
+            // partially-computed result instead of using it.
+            sd_cancel_check_t cancel_cb = sd_get_cancel_check_callback();
+            if (cancel_cb != nullptr && cancel_cb(sd_get_cancel_check_callback_data())) {
+                LOG_DEBUG("%s: graph compute cancelled mid-step", get_desc().c_str());
+                return std::nullopt;
+            }
+        } else {
+            if (status == GGML_STATUS_ABORTED) {
+                LOG_DEBUG("%s: graph compute aborted by cancel", get_desc().c_str());
+            } else {
+                LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            }
             return std::nullopt;
         }
 

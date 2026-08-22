@@ -352,6 +352,9 @@ bool sd_preview_noisy                = false;
 static sd_graph_eval_callback_t sd_backend_eval_cb = nullptr;
 static void* sd_backend_eval_cb_data               = nullptr;
 
+static sd_cancel_check_t sd_cancel_check_cb = nullptr;
+static void* sd_cancel_check_cb_data        = nullptr;
+
 std::u32string utf8_to_utf32(const std::string& utf8_str) {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
     return converter.from_bytes(utf8_str);
@@ -638,6 +641,19 @@ void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, b
 void sd_set_backend_eval_callback(sd_graph_eval_callback_t cb, void* data) {
     sd_backend_eval_cb      = cb;
     sd_backend_eval_cb_data = data;
+}
+
+void sd_set_cancel_check_callback(sd_cancel_check_t callback, void* user_data) {
+    sd_cancel_check_cb      = callback;
+    sd_cancel_check_cb_data = user_data;
+}
+
+sd_cancel_check_t sd_get_cancel_check_callback() {
+    return sd_cancel_check_cb;
+}
+
+void* sd_get_cancel_check_callback_data() {
+    return sd_cancel_check_cb_data;
 }
 
 sd_preview_cb_t sd_get_preview_callback() {

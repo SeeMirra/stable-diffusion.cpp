@@ -92,6 +92,14 @@ ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,
                                                         ggml_cgraph* gf,
                                                         sd_graph_eval_callback_t callback_eval,
                                                         void* callback_eval_user_data);
+
+// Cancel-check hook. When registered, the graph executors check it between chunks of
+// nodes and abort an in-flight compute when it returns true, so a generation can be
+// stopped mid-step instead of running to the end of the graph.
+typedef bool (*sd_cancel_check_t)(void* user_data);
+void sd_set_cancel_check_callback(sd_cancel_check_t callback, void* user_data);
+sd_cancel_check_t sd_get_cancel_check_callback();
+void* sd_get_cancel_check_callback_data();
 std::string sd_backend_resolve_name(const std::string& name);
 const char* sd_backend_module_name(SDBackendModule module);
 void ggml_ext_im_set_f32_1d(const struct ggml_tensor* tensor, int i, float value);
